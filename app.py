@@ -27,9 +27,19 @@ def now_str():
 def lookup_cas_kosha(cas_no: str) -> dict:
     info = {
         "cas": cas_no, "name": "", "source": "",
+        # 산업안전보건법
         "managed": False, "special": False, "measure": False,
-        "health": False, "toxic": False, "hazmat": "", "hp": False,
-        "twa": "", "stel": "", "raw_reg": "",
+        "health": False, "permitted": False, "prohibited": False,
+        # 화학물질관리법
+        "toxic": False, "restricted": False, "prohibited_chem": False, "accident_prep": False,
+        # 위험물/고압가스/기타
+        "hazmat": "", "hp": False, "ozone": False, "pops": False,
+        # 노출기준
+        "twa": "", "stel": "",
+        # GHS 분류
+        "ghs_class": "", "signal": "",
+        # 원본
+        "raw_reg": "", "raw_items": [],
         "success": False, "error": ""
     }
     if not KOSHA_OK:
@@ -54,16 +64,52 @@ def lookup_cas_kosha(cas_no: str) -> dict:
     chem_id = search["chemId"]
     info["name"] = search.get("chemNameKor", "")
     info["source"] = "✅ KOSHA API (최신)"
+    
+    # ── 15번: 법적 규제현황 (전체 법률) ──
     try:
         time.sleep(0.3)
         regs = get_legal_regulations(chem_id)
+        # 산업안전보건법
         info["managed"] = regs.get("managedHazard") == "O"
         info["special"] = regs.get("specialManaged") == "O"
         info["measure"] = regs.get("measurement") == "O"
         info["health"] = regs.get("healthCheck") == "O"
+        info["permitted"] = regs.get("permitted") == "O"
+        info["prohibited"] = regs.get("prohibited") == "O"
+        # 화학물질관리법
+        info["toxic"] = regs.get("toxic") == "O"
+        info["restricted"] = regs.get("restricted") == "O"
+        info["prohibited_chem"] = regs.get("prohibited_chem") == "O"
+        info["accident_prep"] = regs.get("accident_prep") == "O"
+        # 위험물/고압가스/기타
+        info["hazmat"] = regs.get("hazmat_class", "")
+        info["hp"] = regs.get("hp_gas") == "O"
+        info["ozone"] = regs.get("ozone") == "O"
+        info["pops"] = regs.get("residual_pop") == "O"
         info["raw_reg"] = regs.get("rawText", "")
+        info["raw_items"] = regs.get("raw_items", [])
     except Exception as e:
         info["error"] = f"⚠️ 규제조회 실패: {str(e)[:100]}"
+    
+    # ── 2번: GHS 유해성·위험성 분류 ──
+    try:
+        time.sleep(0.3)
+        haz = get_hazard_classification(chem_id)
+        ghs_text = haz.get("classification", "")
+        info["ghs_class"] = ghs_text
+        info["signal"] = haz.get("signal", "")
+        # GHS 분류로 추가 판별 (API 15번에서 놓친 경우 보완)
+        if ghs_text:
+            if any(k in ghs_text for k in ["발암성", "Carc"]) and not info["special"]:
+                info["special"] = True
+            if any(k in ghs_text for k in ["생식세포 변이원성", "Muta"]) and not info["special"]:
+                info["special"] = True
+            if any(k in ghs_text for k in ["생식독성", "Repr"]) and not info["special"]:
+                info["special"] = True
+    except:
+        pass
+    
+    # ── 8번: 노출기준 ──
     try:
         time.sleep(0.3)
         exp = get_exposure_limits(chem_id)
@@ -129,58 +175,130 @@ def parse_content_pct(content_str: str) -> float:
 # ── 함유량 기준(Cut-off Value) ──
 # 고용노동부 고시 「화학물질의 분류·표시 및 MSDS에 관한 기준」 별표 1 근거
 CUTOFF_RULES = {
-    # 규제 항목: (일반 cut-off %, CMR(발암/변이) cut-off %, 설명)
+    # 규제 항목: (일반 cut-off %, CMR cut-off %, 설명)
     'managed':  {'default': 1.0, 'cmr': 0.1, 'desc': '관리대상유해물질 (산안법)'},
     'special':  {'default': 0.1, 'cmr': 0.1, 'desc': '특별관리물질-CMR (산안법)'},
     'measure':  {'default': 1.0, 'cmr': 0.1, 'desc': '작업환경측정 대상 (산안법)'},
     'health':   {'default': 1.0, 'cmr': 0.1, 'desc': '특수건강진단 대상 (산안법)'},
-    'toxic':    {'default': 1.0, 'cmr': 1.0, 'desc': '유독물질 (화관법, 물질별 상이)'},
+    'toxic':    {'default': 1.0, 'cmr': 1.0, 'desc': '유독물질 (화관법)'},
+    'restricted': {'default': 0.1, 'cmr': 0.1, 'desc': '제한물질 (화관법)'},
+    'accident_prep': {'default': 1.0, 'cmr': 1.0, 'desc': '사고대비물질 (화관법)'},
 }
+# 허가대상·금지물질·위험물·고압가스는 함유량 cut-off 없이 물질 자체 성질로 판단
 
 
 def apply_cutoff(info: dict) -> dict:
     """
     KOSHA API 규제 결과 + 함유량 → cut-off 적용
-    info에 'content_pct'(숫자)가 있어야 함
-    
-    결과: info에 '_filtered' 접미 키 추가
-      managed_filtered: True/False (cut-off 통과 여부)
-      managed_note: "함유량 0.5% < 기준 1% → 비해당" 등
     """
     pct = info.get('content_pct', -1)
-    is_cmr = info.get('special', False)  # CMR 물질이면 낮은 cut-off 적용
+    is_cmr = info.get('special', False)
     
     for key, rule in CUTOFF_RULES.items():
         raw_val = info.get(key, False)
         cutoff = rule['cmr'] if is_cmr else rule['default']
         
         if not raw_val:
-            # KOSHA에서 해당 없음 → 필터링 불필요
             info[f'{key}_filtered'] = False
             info[f'{key}_note'] = ''
             continue
         
         if pct < 0:
-            # 함유량 정보 없음 → 보수적으로 해당 처리
             info[f'{key}_filtered'] = True
-            info[f'{key}_note'] = '⚠️ 함유량 미확인 → 해당으로 간주 (보수적 판단)'
+            info[f'{key}_note'] = '⚠️ 함유량 미확인 → 해당으로 간주'
             continue
         
         if pct >= cutoff:
             info[f'{key}_filtered'] = True
-            info[f'{key}_note'] = f'✅ 함유량 {pct}% ≥ 기준 {cutoff}% → 해당'
+            info[f'{key}_note'] = f'✅ {pct}% ≥ {cutoff}% → 해당'
         else:
             info[f'{key}_filtered'] = False
-            info[f'{key}_note'] = f'💚 함유량 {pct}% < 기준 {cutoff}% → 비해당'
+            info[f'{key}_note'] = f'💚 {pct}% < {cutoff}% → 비해당'
     
-    # 위험물/고압가스는 물질 자체 성질이므로 함유량 cut-off 적용 안함
+    # 허가대상·금지물질: 함유량 무관, 물질 자체 판정
+    info['permitted_filtered'] = bool(info.get('permitted'))
+    info['prohibited_filtered'] = bool(info.get('prohibited'))
+    info['prohibited_chem_filtered'] = bool(info.get('prohibited_chem'))
+    # 위험물/고압가스/오존/POPs: 물질 성질
     info['hazmat_filtered'] = bool(info.get('hazmat'))
     info['hp_filtered'] = bool(info.get('hp'))
+    info['ozone_filtered'] = bool(info.get('ozone'))
+    info['pops_filtered'] = bool(info.get('pops'))
     
-    # 종합: 하나라도 규제 해당이면 regulated = True
-    info['any_regulated'] = any(info.get(f'{k}_filtered') for k in ['managed','special','measure','health','toxic','hazmat_filtered','hp_filtered'])
+    # 종합
+    info['any_regulated'] = any([
+        info.get('managed_filtered'), info.get('special_filtered'),
+        info.get('measure_filtered'), info.get('health_filtered'),
+        info.get('toxic_filtered'), info.get('restricted_filtered'),
+        info.get('accident_prep_filtered'),
+        info.get('permitted_filtered'), info.get('prohibited_filtered'),
+        info.get('prohibited_chem_filtered'),
+        info.get('hazmat_filtered'), info.get('hp_filtered'),
+        info.get('ozone_filtered'), info.get('pops_filtered'),
+    ])
     
     return info
+
+
+# ═══════════════════════════════
+#  규제 태그 생성 (모든 법률)
+# ═══════════════════════════════
+def make_tags(c, style="markdown"):
+    """
+    화학물질 info dict → 규제 태그 리스트 생성
+    style: "markdown" → `🟡관리대상`, "plain" → 🟡관리대상
+    
+    전체 규제 카테고리:
+      산안법: 관리대상, 특별관리(CMR), 허가대상, 금지물질
+      화관법: 유독물질, 제한물질, 금지물질, 사고대비물질
+      위험물법: 위험물 (류 표시)
+      고압가스, 오존층, POPs
+    """
+    tags = []
+    w = lambda icon, label: f"`{icon}{label}`" if style == "markdown" else f"{icon}{label}"
+    wf = lambda icon, label: f"`💚{label}(미달)`" if style == "markdown" else f"~~{label}~~💚미달"
+    
+    # ── 산업안전보건법 ──
+    if c.get('managed'):
+        tags.append(w("🟡","관리대상") if c.get('managed_filtered', c.get('managed')) else wf("💚","관리대상"))
+    if c.get('special'):
+        tags.append(w("🔴","특별관리(CMR)") if c.get('special_filtered', c.get('special')) else wf("💚","CMR"))
+    if c.get('permitted'):
+        tags.append(w("🟣","허가대상"))  # 함유량 무관
+    if c.get('prohibited'):
+        tags.append(w("⛔","금지물질"))
+    if c.get('measure') and not c.get('managed'):  # 관리대상이면 이미 포함
+        if c.get('measure_filtered', c.get('measure')):
+            tags.append(w("📏","측정대상"))
+    if c.get('health') and not c.get('managed'):
+        if c.get('health_filtered', c.get('health')):
+            tags.append(w("🏥","특검대상"))
+    
+    # ── 화학물질관리법 ──
+    if c.get('toxic'):
+        tags.append(w("☠️","유독물질") if c.get('toxic_filtered', c.get('toxic')) else wf("💚","유독"))
+    if c.get('restricted'):
+        tags.append(w("🚫","제한물질") if c.get('restricted_filtered', c.get('restricted')) else wf("💚","제한"))
+    if c.get('prohibited_chem'):
+        tags.append(w("⛔","금지(화관법)"))
+    if c.get('accident_prep'):
+        tags.append(w("🚨","사고대비") if c.get('accident_prep_filtered', c.get('accident_prep')) else wf("💚","사고대비"))
+    
+    # ── 위험물안전관리법 ──
+    if c.get('hazmat'):
+        tags.append(w("🔥", f"위험물({c['hazmat']})") if c['hazmat'] else w("🔥","위험물"))
+    
+    # ── 기타 ──
+    if c.get('hp'):
+        tags.append(w("⚡","고압가스"))
+    if c.get('ozone'):
+        tags.append(w("🌍","오존층"))
+    if c.get('pops'):
+        tags.append(w("☣️","POPs"))
+    
+    if not tags:
+        return [w("✅","규제없음")] if style == "markdown" else ["✅규제없음"]
+    return tags
 
 
 # ═══════════════════════════════
@@ -210,6 +328,10 @@ def build_checklist(profile):
     hasHp = any(c.get('hp_filtered', c.get('hp')) for c in chems)
     hasMeasure = any(c.get('measure_filtered', c.get('measure')) for c in chems)
     hasHealth = any(c.get('health_filtered', c.get('health')) for c in chems)
+    hasRestricted = any(c.get('restricted_filtered', c.get('restricted')) for c in chems)
+    hasAccidentPrep = any(c.get('accident_prep_filtered', c.get('accident_prep')) for c in chems)
+    hasPermitted = any(c.get('permitted_filtered', c.get('permitted')) for c in chems)
+    hasProhibited = any(c.get('prohibited_filtered', c.get('prohibited')) for c in chems)
     hasChem = len(chems) > 0
     hasCert = any(MACHINES.get(m, {}).get('cert') == '안전인증' for m in machs_active)
     hasInsp = any(MACHINES.get(m, {}).get('insp') == '안전검사' for m in machs_active)
@@ -237,7 +359,13 @@ def build_checklist(profile):
     if not hasMng and hasChem:
         items.append({"t": "MSDS 비치 (법 §114)", "d": "화학물질 사용 → MSDS 비치·게시", "p": "high"})
     if hasSp:
-        items.append({"t": "⚠️ 특별관리물질 추가 관리", "d": "발암성·변이원성·생식독성 물질", "p": "critical"})
+        items.append({"t": "⚠️ 특별관리물질(CMR) 추가 관리", "d": "발암성·변이원성·생식독성 물질 → 별도 게시, 기록 30년 보존", "p": "critical"})
+    if hasPermitted:
+        names_p = [c['name'] for c in chems if c.get('permitted')]
+        items.append({"t": "🟣 허가대상물질 사용허가 (법 §118)", "d": f"허가대상: {', '.join(names_p[:3])} → 고용부 장관 허가 필요", "p": "critical"})
+    if hasProhibited:
+        names_x = [c['name'] for c in chems if c.get('prohibited')]
+        items.append({"t": "⛔ 금지물질 제조·사용 금지 (법 §117)", "d": f"금지: {', '.join(names_x[:3])} → 즉시 중단 필요!", "p": "critical"})
     if hasCert:
         items.append({"t": "🔧 안전인증 대상 기계 확인 (법 §84)", "d": "안전인증 마크 확인", "p": "critical"})
     if hasInsp:
@@ -261,15 +389,22 @@ def build_checklist(profile):
             si.append({"t": "안전보건 전담조직 설치", "d": "500인↑", "p": "critical"})
         R["serious"] = {"title": "중대재해처벌법", "icon": "⚖️", "items": si}
 
-    if hasTx:
-        names = [c['name'] for c in chems if c.get('toxic_filtered', c.get('toxic'))]
-        R["chemical"] = {"title": "화학물질관리법(화관법)", "icon": "🧪", "items": [
-            {"t": "유해화학물질 영업허가 (법 §28)", "d": f"유독물질: {', '.join(names[:5])}", "p": "critical"},
-            {"t": "취급시설 설치검사 합격", "d": "검사→통지서→영업개시", "p": "critical"},
-            {"t": "정기검사 4년마다", "d": "취급시설", "p": "critical"},
-            {"t": "장외영향평가서 제출 (법 §23)", "d": "유해화학물질 취급시설", "p": "critical"},
-            {"t": "안전교육 (신규16h/보수8h)", "d": "취급 종사자", "p": "critical"},
-        ]}
+    if hasTx or hasRestricted or hasAccidentPrep:
+        chem_items = []
+        if hasTx:
+            names = [c['name'] for c in chems if c.get('toxic_filtered', c.get('toxic'))]
+            chem_items.append({"t": "☠️ 유독물질 영업허가 (법 §28)", "d": f"유독물질: {', '.join(names[:5])}", "p": "critical"})
+            chem_items.append({"t": "취급시설 설치검사 합격", "d": "검사→통지서→영업개시", "p": "critical"})
+            chem_items.append({"t": "정기검사 4년마다", "d": "취급시설", "p": "critical"})
+            chem_items.append({"t": "장외영향평가서 제출 (법 §23)", "d": "유해화학물질 취급시설", "p": "critical"})
+            chem_items.append({"t": "안전교육 (신규16h/보수8h)", "d": "취급 종사자", "p": "critical"})
+        if hasRestricted:
+            names_r = [c['name'] for c in chems if c.get('restricted_filtered', c.get('restricted'))]
+            chem_items.append({"t": "🚫 제한물질 취급기준 준수 (법 §27)", "d": f"제한물질: {', '.join(names_r[:3])}", "p": "critical"})
+        if hasAccidentPrep:
+            names_a = [c['name'] for c in chems if c.get('accident_prep_filtered', c.get('accident_prep'))]
+            chem_items.append({"t": "🚨 사고대비물질 관리 (법 §39)", "d": f"사고대비: {', '.join(names_a[:3])} → 위해관리계획서 제출", "p": "critical"})
+        R["chemical"] = {"title": "화학물질관리법(화관법)", "icon": "🧪", "items": chem_items}
     if hasHaz:
         names = [f"{c['name']}({c['hazmat']})" for c in chems if c.get('hazmat_filtered', c.get('hazmat'))]
         R["hazmat"] = {"title": "위험물안전관리법", "icon": "🔥", "items": [
@@ -368,19 +503,7 @@ elif st.session_state.step == 2:
     if active:
         st.markdown(f"### 📋 현재 등록 ({len(active)}종)")
         for c in active:
-            tags = []
-            if c.get('managed'):
-                if c.get('managed_filtered', c.get('managed')): tags.append("`🟡관리대상`")
-                else: tags.append("`💚관리대상(미달)`")
-            if c.get('special'):
-                if c.get('special_filtered', c.get('special')): tags.append("`🔴발암`")
-                else: tags.append("`💚발암(미달)`")
-            if c.get('toxic'):
-                if c.get('toxic_filtered', c.get('toxic')): tags.append("`☠️유독`")
-                else: tags.append("`💚유독(미달)`")
-            if c.get('hazmat'): tags.append("`🔥위험물`")
-            if c.get('hp'): tags.append("`⚡고압가스`")
-            tag_str = " ".join(tags) if tags else "`✅규제없음`"
+            tag_str = " ".join(make_tags(c, "markdown"))
             
             pct_info = ""
             if c.get('content_pct', -1) >= 0:
@@ -501,26 +624,7 @@ elif st.session_state.step == 2:
                 st.session_state.chem_results.append(info)
 
                 # 규제 태그 (cut-off 적용 결과)
-                pct_label = f" ({content_str}%)" if content_str else ""
-                tags = []
-                if info.get('managed'):
-                    if info.get('managed_filtered'):
-                        tags.append("🟡관리대상")
-                    else:
-                        tags.append("~~관리대상~~💚미달")
-                if info.get('special'):
-                    if info.get('special_filtered'):
-                        tags.append("🔴발암")
-                    else:
-                        tags.append("~~발암~~💚미달")
-                if info.get('toxic'):
-                    if info.get('toxic_filtered'):
-                        tags.append("☠️유독")
-                    else:
-                        tags.append("~~유독~~💚미달")
-                if info.get('hazmat'): tags.append("🔥위험물")
-                if info.get('hp'): tags.append("⚡고압가스")
-                tag_str = " / ".join(tags) if tags else "✅규제없음"
+                tag_str = " / ".join(make_tags(info, "plain"))
                 
                 cutoff_msg = ""
                 if content_pct >= 0:
@@ -637,16 +741,7 @@ elif st.session_state.step == 2:
             info['msds_file'] = manual_file or '(수동 입력)'
             st.session_state.chem_results.append(info)
 
-            tags = []
-            if info.get('managed'):
-                tags.append("🟡관리대상" if info.get('managed_filtered') else "~~관리대상~~💚미달")
-            if info.get('special'):
-                tags.append("🔴발암" if info.get('special_filtered') else "~~발암~~💚미달")
-            if info.get('toxic'):
-                tags.append("☠️유독" if info.get('toxic_filtered') else "~~유독~~💚미달")
-            if info.get('hazmat'): tags.append("🔥위험물")
-            if info.get('hp'): tags.append("⚡고압가스")
-            tag_str = " / ".join(tags) if tags else "✅규제없음"
+            tag_str = " / ".join(make_tags(info, "plain"))
             pct_note = f"  (함유량 {content_pct}%)" if content_pct >= 0 else ""
             st.write(f"  ↳ **{info['name']}** ({cas}){pct_note} → {tag_str}")
             add_log(f"✍️ {info['name']}({cas}) 수동 입력{pct_note} — {manual_file or '직접입력'}", "MSDS추가(수동)")
@@ -856,14 +951,9 @@ elif st.session_state.step == 5:
         with st.expander(f"🧪 규제 해당 화학물질 ({len(regulated)}종)", expanded=True):
             if regulated:
                 for c in regulated:
-                    tags=[]
-                    if c.get('managed_filtered', c.get('managed')): tags.append("`🟡관리대상`")
-                    if c.get('special_filtered', c.get('special')): tags.append("`🔴발암`")
-                    if c.get('toxic_filtered', c.get('toxic')): tags.append("`☠️유독`")
-                    if c.get('hazmat'): tags.append("`🔥위험물`")
-                    if c.get('hp'): tags.append("`⚡고압가스`")
+                    tag_str = " ".join(make_tags(c, "markdown"))
                     pct = f" [{c.get('content_str','')}%]" if c.get('content_str') else ""
-                    st.markdown(f"- **{c['name']}** ({c['cas']}){pct} → {' '.join(tags)}")
+                    st.markdown(f"- **{c['name']}** ({c['cas']}){pct} → {tag_str}")
             else:
                 st.info("규제 해당 물질 없음")
 
@@ -872,7 +962,7 @@ elif st.session_state.step == 5:
                 st.caption("KOSHA 등록 물질이나, 제품 내 함유량이 법적 기준(cut-off) 미만이라 규제 대상에서 제외됩니다.")
                 for c in below_cutoff:
                     notes = []
-                    for k in ['managed','special','toxic','measure','health']:
+                    for k in ['managed','special','toxic','measure','health','restricted','accident_prep']:
                         note = c.get(f'{k}_note','')
                         if '미달' in note or '비해당' in note:
                             notes.append(note)
