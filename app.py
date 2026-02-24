@@ -218,7 +218,7 @@ def build_checklist(profile):
 # ═══════════════════════════════
 st.set_page_config(page_title="🛡️ EHS 규제진단", page_icon="🛡️", layout="wide")
 for k, v in {'step':1, 'chem_results':[], 'machines_detail':{}, 'profile':{},
-             'checked':{}, 'regs':{}, 'change_log':[], 'parsed_msds':[]}.items():
+             'checked':{}, 'regs':{}, 'change_log':[], 'parsed_msds':[], 'failed_files':[]}.items():
     if k not in st.session_state:
         st.session_state[k] = v if not isinstance(v, (list, dict)) else type(v)(v)
 
@@ -330,7 +330,20 @@ elif st.session_state.step == 2:
             with st.spinner("PDF 파싱 중..."):
                 parsed = parse_msds_pdf(file)
             if not parsed['success']:
-                st.warning(f"⚠️ {parsed['error']}"); continue
+                st.error(f"❌ **{file.name}** — 자동 파싱 실패")
+                st.warning(f"{parsed['error']}")
+                st.info("👇 아래 **'✍️ 수동 CAS 입력'** 에서 직접 입력할 수 있습니다.  \n"
+                         "MSDS 3항(구성성분)에 적힌 **CAS 번호**를 찾아서 입력해 주세요.  \n"
+                         "예: `108-88-3, 1330-20-7`")
+                if parsed.get('full_text'):
+                    with st.expander(f"📄 {file.name} — 추출된 텍스트 (CAS 번호 직접 찾기용)"):
+                        st.text(parsed['full_text'][:3000])
+                # 실패 파일 기록
+                if 'failed_files' not in st.session_state:
+                    st.session_state.failed_files = []
+                if file.name not in st.session_state.failed_files:
+                    st.session_state.failed_files.append(file.name)
+                continue
             st.success(f"✅ 제품: **{parsed['product_name'] or '(미확인)'}** / {len(parsed['components'])}종 발견")
 
             for comp in parsed['components']:
@@ -414,6 +427,67 @@ elif st.session_state.step == 2:
                                 c['remove_date']=(datetime.now()+timedelta(days=days)).strftime("%Y-%m-%d")
                                 add_log(f"🗓️ {c['name']}({target_cas}) → {c['remove_date']} 삭제 예정", "MSDS삭제예정")
                             st.rerun()
+
+    # ── 수동 CAS 입력 (파싱 실패 시 + 언제든 사용 가능) ──
+    st.markdown("---")
+    failed = st.session_state.get('failed_files', [])
+    manual_expanded = len(failed) > 0
+
+    if failed:
+        st.markdown("### ✍️ 수동 CAS 입력")
+        st.warning(f"⚠️ 자동 파싱 실패: **{', '.join(failed)}**  \n"
+                   f"해당 MSDS의 **3항(구성성분)** 표에서 CAS 번호를 찾아 아래에 직접 입력해 주세요.")
+    else:
+        st.markdown("### ✍️ 수동 CAS 입력")
+        st.caption("PDF 파싱이 안 되거나, MSDS 없이 CAS 번호만 아는 경우 직접 입력할 수 있습니다.")
+
+    cas_input = st.text_input(
+        "CAS 번호 (쉼표로 여러 개 가능)",
+        placeholder="예: 108-88-3, 1330-20-7, 67-64-1",
+        key="manual_cas"
+    )
+    manual_file = st.text_input("참고: 어떤 제품/MSDS의 성분인가요? (선택사항)",
+                                placeholder="예: ○○신너, △△세정제",
+                                key="manual_ref")
+
+    if cas_input and st.button("🔍 수동 입력 조회", type="primary", key="manual_btn"):
+        import re
+        cas_list = [c.strip() for c in cas_input.replace('，', ',').split(',') if c.strip()]
+        valid, invalid = [], []
+        for c in cas_list:
+            (valid if re.match(r'^\d{2,7}-\d{2}-\d$', c) else invalid).append(c)
+
+        if invalid:
+            st.error(f"❌ CAS 형식 오류: {', '.join(invalid)}  \n올바른 형식: `108-88-3` (숫자-숫자-숫자)")
+
+        for cas in valid:
+            if any(r['cas'] == cas and r.get('status') != 'removing' for r in st.session_state.chem_results):
+                st.write(f"  ↳ {cas} — 이미 등록됨 ✅"); continue
+
+            with st.spinner(f"🔍 CAS {cas} → KOSHA API 조회..."):
+                info = lookup_cas_kosha(cas)
+            if not info.get('success'):
+                st.error(f"  ↳ **{cas}** — 조회 실패")
+                st.warning(info.get('error', '')); continue
+
+            info['status'] = 'active'
+            info['added_date'] = now_str()
+            info['msds_file'] = manual_file or '(수동 입력)'
+            st.session_state.chem_results.append(info)
+
+            tags = []
+            if info.get('managed'): tags.append("🟡관리대상")
+            if info.get('special'): tags.append("🔴발암")
+            if info.get('toxic'): tags.append("☠️유독")
+            if info.get('hazmat'): tags.append("🔥위험물")
+            tag_str = " / ".join(tags) if tags else "✅규제없음"
+            st.write(f"  ↳ **{info['name']}** ({cas}) → {tag_str}")
+            add_log(f"✍️ {info['name']}({cas}) 수동 입력 — {manual_file or '직접입력'}", "MSDS추가(수동)")
+
+        if valid:
+            act_count = len([c for c in st.session_state.chem_results if c.get('status') != 'removing'])
+            st.success(f"✅ 완료! 현재 등록: {act_count}종")
+            st.session_state.failed_files = []
 
     st.markdown("---")
     c1,c2 = st.columns(2)
