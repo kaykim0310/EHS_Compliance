@@ -192,28 +192,54 @@ def get_exposure_limits(chem_id: str) -> Dict[str, str]:
 
 def get_legal_regulations(chem_id: str) -> Dict[str, str]:
     """
-    법적 규제현황 조회 (15번 항목)
+    법적 규제현황 조회 (15번 항목) — 모든 법률 카테고리 파싱
     
     Args:
         chem_id: 화학물질 ID (6자리)
     
     Returns:
         {
+            # ── 산업안전보건법 ──
             'measurement': 'O/X',      # 작업환경측정 대상
             'healthCheck': 'O/X',      # 특수건강진단 대상
             'managedHazard': 'O/X',    # 관리대상유해물질
-            'specialManaged': 'O/X',   # 특별관리물질
-            'rawText': '...'           # 원본 텍스트
+            'specialManaged': 'O/X',   # 특별관리물질 (CMR)
+            'permitted': 'O/X',        # 허가대상물질
+            'prohibited': 'O/X',       # 금지물질
+            'pse': 'O/X',             # PSE(공정안전보고서) 제출대상
+            
+            # ── 화학물질관리법 ──
+            'toxic': 'O/X',           # 유독물질
+            'restricted': 'O/X',      # 제한물질
+            'prohibited_chem': 'O/X', # 금지물질(화관법)
+            'accident_prep': 'O/X',   # 사고대비물질
+            
+            # ── 위험물안전관리법 ──
+            'hazmat_class': '',        # 위험물 류 (예: "4류 제1석유류")
+            
+            # ── 기타 법률 ──
+            'hp_gas': 'O/X',          # 고압가스안전관리법
+            'ozone': 'O/X',           # 오존층보호법
+            'residual_pop': 'O/X',    # 잔류성유기오염물질
+            'eu_reach': '',            # EU REACH 등
+            
+            'rawText': '...',
+            'raw_items': [...]         # 원본 항목 리스트
         }
     """
     root = _call_api("chemdetail15", {"chemId": chem_id})
     
     result = {
-        "measurement": "X",
-        "healthCheck": "X",
-        "managedHazard": "X",
-        "specialManaged": "X",
-        "rawText": ""
+        # 산업안전보건법
+        "measurement": "X", "healthCheck": "X", "managedHazard": "X",
+        "specialManaged": "X", "permitted": "X", "prohibited": "X", "pse": "X",
+        # 화학물질관리법
+        "toxic": "X", "restricted": "X", "prohibited_chem": "X", "accident_prep": "X",
+        # 위험물안전관리법
+        "hazmat_class": "",
+        # 기타
+        "hp_gas": "X", "ozone": "X", "residual_pop": "X", "eu_reach": "",
+        "rawText": "", "raw_items": []
     }
     
     if root is None:
@@ -229,23 +255,73 @@ def get_legal_regulations(chem_id: str) -> Dict[str, str]:
         if not detail or detail in ["해당없음", "자료없음", ""]:
             continue
         
-        if "산업안전보건법" in name_kor:
-            raw_texts.append(detail)
-            
-            # 규제 항목 파싱
+        raw_texts.append(f"[{name_kor}] {detail}")
+        result["raw_items"].append({"section": name_kor, "detail": detail})
+        
+        detail_lower = detail.lower()
+        
+        # ── 산업안전보건법 ──
+        if "산업안전보건법" in name_kor or "산업안전" in name_kor:
             if any(k in detail for k in ["작업환경측정", "측정대상"]):
                 result["measurement"] = "O"
             if any(k in detail for k in ["특수건강진단", "건강진단"]):
                 result["healthCheck"] = "O"
             if any(k in detail for k in ["관리대상", "유해물질"]):
                 result["managedHazard"] = "O"
-            if any(k in detail for k in ["특별관리", "발암성", "CMR"]):
+            if any(k in detail for k in ["특별관리", "발암성", "CMR", "생식세포", "생식독성"]):
                 result["specialManaged"] = "O"
-            
-            # 일반 규제 표시가 있으면 기본 항목 O
-            if detail and result["measurement"] == "X":
-                result["measurement"] = "O"
-                result["healthCheck"] = "O"
+            if any(k in detail for k in ["허가대상", "허가물질"]):
+                result["permitted"] = "O"
+            if any(k in detail for k in ["금지물질", "사용금지", "제조금지"]):
+                result["prohibited"] = "O"
+            if any(k in detail for k in ["PSE", "공정안전", "공정안전보고서"]):
+                result["pse"] = "O"
+            # 규제 텍스트가 있으면 최소한 관리대상
+            if detail and result["managedHazard"] == "X":
+                if any(k in detail for k in ["노출기준", "규제"]):
+                    result["managedHazard"] = "O"
+        
+        # ── 화학물질관리법(화관법) ──
+        if "화학물질관리법" in name_kor or "화관법" in name_kor:
+            if any(k in detail for k in ["유독물질", "유독"]):
+                result["toxic"] = "O"
+            if any(k in detail for k in ["제한물질", "사용제한"]):
+                result["restricted"] = "O"
+            if any(k in detail for k in ["금지물질", "사용금지"]):
+                result["prohibited_chem"] = "O"
+            if any(k in detail for k in ["사고대비", "사고대비물질"]):
+                result["accident_prep"] = "O"
+            # 화관법 언급만 있어도 최소 유독물질 가능성
+            if detail and result["toxic"] == "X":
+                if "유해" in detail or "지정" in detail:
+                    result["toxic"] = "O"
+        
+        # ── 위험물안전관리법 ──
+        if "위험물" in name_kor:
+            import re
+            hm_match = re.search(r'(\d류[^\s,]*)', detail)
+            if hm_match:
+                result["hazmat_class"] = hm_match.group(1)
+            elif any(k in detail for k in ["제1류", "제2류", "제3류", "제4류", "제5류", "제6류"]):
+                hm_match2 = re.search(r'(제\d류[^\s,]*)', detail)
+                if hm_match2:
+                    result["hazmat_class"] = hm_match2.group(1)
+        
+        # ── 고압가스안전관리법 ──
+        if "고압가스" in name_kor or "고압가스" in detail:
+            result["hp_gas"] = "O"
+        
+        # ── 오존층보호법 ──
+        if "오존" in name_kor or "오존" in detail:
+            result["ozone"] = "O"
+        
+        # ── 잔류성유기오염물질 ──
+        if "잔류성" in name_kor or "POPs" in detail.upper():
+            result["residual_pop"] = "O"
+        
+        # ── EU / 해외 규제 ──
+        if "EU" in name_kor or "REACH" in detail.upper():
+            result["eu_reach"] = detail[:100]
     
     result["rawText"] = " | ".join(raw_texts)
     return result
