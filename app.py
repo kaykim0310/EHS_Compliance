@@ -452,6 +452,211 @@ for k, v in {'step':1, 'chem_results':[], 'machines_detail':{}, 'profile':{},
 
 def go(n): st.session_state.step = n
 
+
+# ═══════════════════════════════
+#  회사별 저장/불러오기 시스템
+# ═══════════════════════════════
+import json as _json
+import glob as _glob
+from pathlib import Path as _Path
+
+SAVE_DIR = _Path("data")
+SAVE_DIR.mkdir(exist_ok=True)
+
+# 저장 대상 키 목록
+_SAVE_KEYS = ['profile', 'chem_results', 'machines_detail', 'change_log']
+
+def _company_filename(name: str) -> _Path:
+    """회사명 → 안전한 파일명"""
+    safe = "".join(c if c.isalnum() or c in (' ','-','_') else '_' for c in name).strip()
+    return SAVE_DIR / f"{safe}.json"
+
+def _save_company(name: str = None) -> str:
+    """현재 세션 데이터를 회사 파일로 저장"""
+    if not name:
+        name = st.session_state.profile.get('name', '').strip()
+    if not name:
+        return "❌ 회사명이 없습니다. Step 1에서 회사명을 먼저 입력하세요."
+    
+    data = {"_saved_at": now_str(), "_version": "v4.1"}
+    for k in _SAVE_KEYS:
+        data[k] = st.session_state.get(k, {} if k in ('profile','machines_detail') else [])
+    
+    fpath = _company_filename(name)
+    try:
+        with open(fpath, 'w', encoding='utf-8') as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+        return f"✅ **{name}** 저장 완료 ({fpath.name})"
+    except Exception as e:
+        return f"❌ 저장 실패: {e}"
+
+def _load_company(fpath: _Path) -> str:
+    """파일에서 세션으로 불러오기"""
+    try:
+        with open(fpath, 'r', encoding='utf-8') as f:
+            data = _json.load(f)
+        for k in _SAVE_KEYS:
+            if k in data:
+                st.session_state[k] = data[k]
+        # 불러온 후 Step 1으로
+        st.session_state.step = 1
+        st.session_state.failed_files = []
+        name = data.get('profile', {}).get('name', fpath.stem)
+        return f"✅ **{name}** 불러오기 완료"
+    except Exception as e:
+        return f"❌ 불러오기 실패: {e}"
+
+def _list_saved() -> list:
+    """저장된 회사 목록"""
+    files = sorted(SAVE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    result = []
+    for f in files:
+        try:
+            with open(f, 'r', encoding='utf-8') as fp:
+                d = _json.load(fp)
+            name = d.get('profile', {}).get('name', f.stem)
+            saved_at = d.get('_saved_at', '?')
+            workers = d.get('profile', {}).get('workers', '?')
+            chems = len(d.get('chem_results', []))
+            result.append({'name': name, 'file': f, 'saved_at': saved_at, 
+                          'workers': workers, 'chems': chems})
+        except:
+            result.append({'name': f.stem, 'file': f, 'saved_at': '?', 'workers': '?', 'chems': 0})
+    return result
+
+def _delete_company(fpath: _Path) -> str:
+    """회사 데이터 삭제"""
+    try:
+        name = fpath.stem
+        fpath.unlink()
+        return f"🗑️ **{name}** 삭제 완료"
+    except Exception as e:
+        return f"❌ 삭제 실패: {e}"
+
+def _new_session():
+    """세션 초기화 (새 회사)"""
+    for k, v in {'step':1, 'chem_results':[], 'machines_detail':{}, 'profile':{},
+                 'checked':{}, 'regs':{}, 'change_log':[], 'parsed_msds':[], 'failed_files':[]}.items():
+        st.session_state[k] = v if not isinstance(v, (list, dict)) else type(v)(v)
+
+
+# ── 사이드바: 회사 관리 ──
+with st.sidebar:
+    st.markdown("## 📂 회사별 데이터 관리")
+    
+    # 현재 세션 정보
+    cur_name = st.session_state.profile.get('name', '')
+    if cur_name:
+        chems_n = len([c for c in st.session_state.chem_results if c.get('status') != 'removing'])
+        machs_n = len([k for k,v in st.session_state.machines_detail.items() if v.get('status') == 'active'])
+        st.info(f"📌 현재: **{cur_name}**  \n화학물질 {chems_n}종 · 기계 {machs_n}종")
+    else:
+        st.caption("현재 회사가 선택되지 않았습니다.")
+    
+    st.markdown("---")
+    
+    # 저장
+    col_s1, col_s2 = st.columns(2)
+    if col_s1.button("💾 저장", use_container_width=True, disabled=not cur_name):
+        msg = _save_company()
+        if "✅" in msg:
+            st.success(msg)
+            add_log(f"💾 데이터 저장됨", "시스템")
+        else:
+            st.error(msg)
+    
+    if col_s2.button("🆕 새 회사", use_container_width=True):
+        if cur_name:
+            _save_company()  # 현재 데이터 자동 저장
+        _new_session()
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # 저장된 회사 목록
+    saved = _list_saved()
+    if saved:
+        st.markdown(f"### 💼 저장된 회사 ({len(saved)}개)")
+        
+        for i, s in enumerate(saved):
+            with st.container():
+                st.markdown(
+                    f"**{s['name']}**  \n"
+                    f"<small style='color:#888'>👥{s['workers']}명 · 🧪{s['chems']}종 · 💾{s['saved_at']}</small>",
+                    unsafe_allow_html=True
+                )
+                lc, dc = st.columns(2)
+                if lc.button("📂 불러오기", key=f"load_{i}", use_container_width=True):
+                    # 현재 세션 자동 저장
+                    if cur_name:
+                        _save_company()
+                    msg = _load_company(s['file'])
+                    if "✅" in msg:
+                        st.success(msg)
+                        add_log(f"📂 데이터 불러옴: {s['name']}", "시스템")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                if dc.button("🗑️", key=f"del_{i}", use_container_width=True):
+                    st.session_state[f'confirm_del_{i}'] = True
+                
+                # 삭제 확인
+                if st.session_state.get(f'confirm_del_{i}'):
+                    st.warning(f"⚠️ **{s['name']}** 데이터를 삭제할까요?")
+                    yc, nc = st.columns(2)
+                    if yc.button("✅ 삭제", key=f"yes_del_{i}", type="primary"):
+                        msg = _delete_company(s['file'])
+                        st.session_state[f'confirm_del_{i}'] = False
+                        st.success(msg)
+                        st.rerun()
+                    if nc.button("취소", key=f"no_del_{i}"):
+                        st.session_state[f'confirm_del_{i}'] = False
+                        st.rerun()
+                
+                st.markdown("<hr style='margin:8px 0;border-color:#eee'>", unsafe_allow_html=True)
+    else:
+        st.caption("💡 저장된 회사가 없습니다.  \n회사명 입력 후 '💾 저장' 버튼을 눌러주세요.")
+    
+    st.markdown("---")
+    
+    # 내보내기/가져오기
+    with st.expander("📤 내보내기 / 📥 가져오기"):
+        st.caption("다른 PC로 데이터를 이동할 때 사용합니다.")
+        
+        # 내보내기: 전체 회사 데이터를 하나의 JSON으로
+        if saved and st.button("📤 전체 백업 다운로드"):
+            all_data = {}
+            for s in saved:
+                try:
+                    with open(s['file'], 'r', encoding='utf-8') as f:
+                        all_data[s['name']] = _json.load(f)
+                except:
+                    pass
+            backup_json = _json.dumps(all_data, ensure_ascii=False, indent=2)
+            st.download_button(
+                "💾 backup.json 다운로드",
+                data=backup_json,
+                file_name=f"EHS_backup_{now_str()[:10]}.json",
+                mime="application/json"
+            )
+        
+        # 가져오기
+        uploaded_backup = st.file_uploader("📥 백업 파일 업로드", type=['json'], key="backup_upload")
+        if uploaded_backup:
+            try:
+                backup = _json.loads(uploaded_backup.read().decode('utf-8'))
+                count = 0
+                for cname, cdata in backup.items():
+                    if isinstance(cdata, dict) and 'profile' in cdata:
+                        fpath = _company_filename(cname)
+                        with open(fpath, 'w', encoding='utf-8') as f:
+                            _json.dump(cdata, f, ensure_ascii=False, indent=2)
+                        count += 1
+                st.success(f"✅ {count}개 회사 데이터 가져오기 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 가져오기 실패: {e}")
+
 # Header
 st.markdown("""
 <div style="background:linear-gradient(135deg,#0D1B2A,#2C3E50);padding:20px 28px;border-radius:16px;color:white;margin-bottom:16px">
@@ -460,14 +665,31 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Steps bar
-step_labels = ["①기본정보","②MSDS관리","③기계·설비","④시설현황","⑤진단결과","⑥대시보드","⑦변경이력"]
-cols = st.columns(len(step_labels))
-for i,(c,l) in enumerate(zip(cols,step_labels)):
-    n=i+1
-    if n<st.session_state.step: c.markdown(f"<div style='text-align:center;padding:5px;background:#E3F2FD;border-radius:8px;font-size:10px;font-weight:700;color:#1565C0'>✅{l}</div>",unsafe_allow_html=True)
-    elif n==st.session_state.step: c.markdown(f"<div style='text-align:center;padding:5px;background:#1565C0;border-radius:8px;font-size:10px;font-weight:700;color:white'>👉{l}</div>",unsafe_allow_html=True)
-    else: c.markdown(f"<div style='text-align:center;padding:5px;background:#F5F5F5;border-radius:8px;font-size:10px;color:#999'>{l}</div>",unsafe_allow_html=True)
+# Steps bar — 2줄 배치 + 큰 글씨 + 클릭 가능
+cur = st.session_state.step
+step_data = [
+    (1,"📌","기본정보"), (2,"📄","MSDS"), (3,"🔧","기계·설비"), (4,"🏗️","시설"),
+    (5,"📊","진단결과"), (6,"📈","대시보드"), (7,"📋","변경이력")
+]
+
+def _step_html(n, icon, label):
+    if n < cur:
+        return f"<div style='text-align:center;padding:8px 4px;background:#E3F2FD;border-radius:10px;font-size:14px;font-weight:700;color:#1565C0;cursor:pointer'>✅ {label}</div>"
+    elif n == cur:
+        return f"<div style='text-align:center;padding:8px 4px;background:#1565C0;border-radius:10px;font-size:14px;font-weight:700;color:white;box-shadow:0 2px 8px rgba(21,101,192,0.4)'>👉 {icon} {label}</div>"
+    else:
+        return f"<div style='text-align:center;padding:8px 4px;background:#F5F5F5;border-radius:10px;font-size:14px;color:#999'>{icon} {label}</div>"
+
+# 상단 4개
+row1 = st.columns(4)
+for i, (n, icon, label) in enumerate(step_data[:4]):
+    row1[i].markdown(_step_html(n, icon, label), unsafe_allow_html=True)
+
+# 하단 3개
+row2 = st.columns([1,1,1,1])
+for i, (n, icon, label) in enumerate(step_data[4:]):
+    row2[i].markdown(_step_html(n, icon, label), unsafe_allow_html=True)
+
 st.markdown("---")
 
 
@@ -981,7 +1203,13 @@ elif st.session_state.step == 5:
     st.markdown("---")
     c1,c2 = st.columns(2)
     if c1.button("← 처음부터", use_container_width=True): go(1); st.rerun()
-    if c2.button("✅ 대시보드 →", type="primary", use_container_width=True): go(6); st.rerun()
+    if c2.button("✅ 대시보드 →", type="primary", use_container_width=True):
+        # 진단 완료 → 자동 저장
+        name = st.session_state.profile.get('name','')
+        if name:
+            _save_company(name)
+            add_log("💾 진단 완료 → 자동 저장", "시스템")
+        go(6); st.rerun()
 
 
 # ═══════════════════════════════════════════
